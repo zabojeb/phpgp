@@ -1,12 +1,11 @@
 # phpgp
-phPGP - tool to store your PGP keys on the physical storage (USB, flash drive etc.)
 
-Tool is very very WIP now.
+**phpgp** — утилита для безопасного хранения и использования PGP ключей на флешках и других внешних накопителях.
 
-## Installation
-Simply run
+## Установка
+
+Установите пакет с помощью pip:
+
+```bash
+pip install phpgp
 ```
-sudo curl -s https://raw.githubusercontent.com/zabojeb/phpgp/refs/heads/main/install.sh | bash && rm -f install.sh
-```
-in any place of your machine.
-

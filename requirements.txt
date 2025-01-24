@@ -1,0 +1,6 @@
+pgpy
+psutil
+prompt_toolkit
+click
+cryptography
+python-gnupg

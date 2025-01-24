@@ -1,0 +1,495 @@
+import os
+import sys
+import json
+import base64
+import shutil
+import socket
+import subprocess
+import platform
+from getpass import getpass
+import threading
+
+import click
+import gnupg
+import psutil
+from pgpy import PGPKey, PGPMessage
+
+from .utils import select_drive, get_pid_file_path, get_cache_dir
+from .server import start_server
+
+if platform.system() == "Windows":
+    HOST = "127.0.0.1"
+    PORT = 65432
+else:
+    SOCKET_PATH = "/tmp/phpgp.sock"
+
+
+@click.group()
+def cli():
+    """
+    The main CLI for phpgp — a utility to securely store and use PGP keys
+    on external drives (USB, etc). It interacts with a background server
+    that handles cryptographic operations (sign, encrypt, decrypt).
+    """
+    pass
+
+
+@cli.command()
+def configure():
+    """
+    Configure an external drive for use with phpgp. Copies the user's
+    private/public keys to the drive and optionally deletes them
+    from the local machine.
+    """
+    drive = select_drive()
+    click.echo(f"Selected drive: {drive}")
+
+    private_key_path = click.prompt(
+        "Enter full path to your private key", type=click.Path(exists=True)
+    )
+    public_key_path = click.prompt(
+        "Enter full path to your public key", type=click.Path(exists=True)
+    )
+
+    phpgp_path = os.path.join(drive, ".phpgp")
+    private_path = os.path.join(phpgp_path, "private")
+    public_path = os.path.join(phpgp_path, "public")
+
+    os.makedirs(private_path, exist_ok=True)
+    os.makedirs(public_path, exist_ok=True)
+
+    shutil.copy(private_key_path, private_path)
+    shutil.copy(public_key_path, public_path)
+
+    click.echo(f"Keys copied to {phpgp_path}")
+
+    delete = click.confirm(
+        "Delete original key files from the computer?", default=False)
+    if delete:
+        os.remove(private_key_path)
+        os.remove(public_key_path)
+        click.echo("Original keys deleted.")
+    else:
+        click.echo("Original keys retained.")
+
+
+@cli.command()
+def status():
+    """
+    Checks the status of connected external drives, indicating whether
+    each is ready to mount (contains .phpgp) or ready to configure.
+    """
+    partitions = psutil.disk_partitions()
+    external_drives = [
+        p.mountpoint for p in partitions if 'removable' in p.opts or 'usb' in p.opts
+    ]
+
+    if not external_drives:
+        click.echo("No external drives found.")
+        return
+
+    for drive in external_drives:
+        phpgp_path = os.path.join(drive, ".phpgp")
+        if os.path.exists(phpgp_path):
+            status = "Ready to mount."
+        else:
+            status = "Ready to configure."
+        click.echo(f"{drive}: {status}")
+
+
+@cli.command()
+def mount():
+    """
+    Mount a configured external drive. Launches the phpgp server in the
+    current terminal, unlocking the user's private key (optionally removing
+    the copies from the external drive).
+    """
+    drive = select_drive()
+    phpgp_path = os.path.join(drive, ".phpgp")
+
+    if not os.path.exists(phpgp_path):
+        click.echo(
+            "Selected drive is not configured. Please run 'phpgp configure' first.")
+        sys.exit(1)
+
+    private_key_path = os.path.join(phpgp_path, "private", "private_key.asc")
+    public_key_path = os.path.join(phpgp_path, "public", "public_key.asc")
+
+    if not os.path.exists(private_key_path) or not os.path.exists(public_key_path):
+        click.echo("Key files not found on the drive.")
+        sys.exit(1)
+
+    # Load keys into memory
+    with open(private_key_path, "r") as f:
+        private_key_data = f.read()
+    with open(public_key_path, "r") as f:
+        public_key_data = f.read()
+
+    # Prompt for passphrase
+    password = getpass("Enter passphrase for your private key: ")
+
+    # Prepare environment variables for the server
+    env = os.environ.copy()
+    env.update({
+        "PRIVATE_KEY": private_key_data,
+        "PUBLIC_KEY": public_key_data,
+        "PRIVATE_KEY_PASSPHRASE": password
+    })
+
+    # Configure startup info for Windows to hide the server window
+    startupinfo = None
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    # Start the server process
+    server_process = subprocess.Popen(
+        [sys.executable, "-m", "phpgp.server"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        startupinfo=startupinfo,
+        text=True
+    )
+    click.echo("phpgp server started.")
+
+    # Get the PID file path from cache directory
+    pid_file = get_pid_file_path()
+    with open(pid_file, "w") as f:
+        f.write(str(server_process.pid))
+
+    # Stream server output to the terminal
+    def stream_output(process):
+        for line in iter(process.stdout.readline, ""):
+            click.echo(line, nl=False)
+        for line in iter(process.stderr.readline, ""):
+            click.echo(line, nl=False, err=True)
+
+    output_thread = threading.Thread(
+        target=stream_output, args=(server_process,))
+    output_thread.daemon = True  # Allows the thread to exit when the main program exits
+    output_thread.start()
+
+    # Optionally delete keys from the external drive
+    delete = click.confirm(
+        "Delete key files from the external drive?", default=True)
+    if delete:
+        os.remove(private_key_path)
+        os.remove(public_key_path)
+        click.echo("Keys removed from the external drive.")
+    else:
+        click.echo("Keys retained on the external drive.")
+
+
+@cli.command()
+def load():
+    """
+    Imports the keys from a configured external drive into the local GPG instance.
+    """
+    drive = select_drive()
+    phpgp_path = os.path.join(drive, ".phpgp")
+
+    if not os.path.exists(phpgp_path):
+        click.echo("Selected drive is not configured.")
+        sys.exit(1)
+
+    private_key_path = os.path.join(phpgp_path, "private", "private_key.asc")
+    public_key_path = os.path.join(phpgp_path, "public", "public_key.asc")
+
+    if not os.path.exists(private_key_path) or not os.path.exists(public_key_path):
+        click.echo("Key files not found on the drive.")
+        sys.exit(1)
+
+    gpg = gnupg.GPG()
+
+    with open(public_key_path, "r") as f:
+        public_key_data = f.read()
+
+    with open(private_key_path, "r") as f:
+        private_key_data = f.read()
+
+    import_result = gpg.import_keys(public_key_data)
+    if import_result.count == 0:
+        click.echo("Failed to import public key.")
+    else:
+        click.echo("Public key imported successfully.")
+
+    import_result = gpg.import_keys(private_key_data)
+    if import_result.count == 0:
+        click.echo("Failed to import private key.")
+    else:
+        click.echo("Private key imported successfully.")
+
+    for fingerprint in import_result.fingerprints:
+        gpg.trust_keys(fingerprint, "TRUST_ULTIMATE")
+        click.echo(f"Key {fingerprint} trusted.")
+
+
+@cli.command()
+def unload():
+    """
+    Removes the locally imported secret key from the GPG instance, if it exists.
+    """
+    import gnupg
+    from getpass import getpass
+
+    gpg = gnupg.GPG()
+    keys = gpg.list_keys(secret=True)
+    if not keys:
+        click.echo("No keys found in GPG.")
+        return
+
+    for key in keys:
+        fingerprint = key["fingerprint"]
+        confirm = click.confirm(
+            f"Do you want to delete key {fingerprint}?", default=False)
+        if confirm:
+            passphrase = getpass("Enter passphrase for the key: ")
+            result = gpg.delete_keys(
+                fingerprint, secret=True, passphrase=passphrase)
+            if result.status == "ok":
+                click.echo(f"Key {fingerprint} deleted successfully.")
+            else:
+                click.echo(
+                    f"Failed to delete key {fingerprint}: {result.status}", err=True)
+                if result.stderr:
+                    click.echo(f"Error: {result.stderr}", err=True)
+
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True))
+def sign(file):
+    """
+    Signs a file through the server. Reads the file in binary mode, encodes
+    in base64, then sends it to the phpgp server for signing. The resulting
+    detached signature is stored as <file>.sig.
+    """
+    if platform.system() == "Windows":
+        HOST = "127.0.0.1"
+        PORT = 65432
+    else:
+        SOCKET_PATH = "/tmp/phpgp.sock"
+
+    with open(file, "rb") as f:
+        data = f.read()
+
+    encoded_data = base64.b64encode(data).decode("utf-8")
+
+    request = {
+        "operation": "sign",
+        "data": encoded_data
+    }
+    request_json = json.dumps(request)
+
+    try:
+        if platform.system() == "Windows":
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect((HOST, PORT))
+                client_socket.sendall(request_json.encode())
+
+                response_data = client_socket.recv(65536).decode()
+                response = json.loads(response_data)
+
+                if "signature" in response:
+                    signature_file = f"{file}.sig"
+                    with open(signature_file, "w") as f_sig:
+                        f_sig.write(response["signature"])
+                    click.echo(f"Signature saved to {signature_file}")
+                else:
+                    click.echo(response.get(
+                        "error", "Unknown error occurred."), err=True)
+                    sys.exit(1)
+        else:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect(SOCKET_PATH)
+                client_socket.sendall(request_json.encode())
+
+                response_data = client_socket.recv(65536).decode()
+                response = json.loads(response_data)
+
+                if "signature" in response:
+                    signature_file = f"{file}.sig"
+                    with open(signature_file, "w") as f_sig:
+                        f_sig.write(response["signature"])
+                    click.echo(f"Signature saved to {signature_file}")
+                else:
+                    click.echo(response.get(
+                        "error", "Unknown error occurred."), err=True)
+                    sys.exit(1)
+    except Exception as e:
+        click.echo(f"Error connecting to phpgp server: {str(e)}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True))
+@click.argument("recipient_email")
+def encrypt(file, recipient_email):
+    """
+    Encrypts a file for the specified recipient email through the server.
+    The server is expected to find or fetch the recipient's public key
+    (if that part is implemented) or use the existing logic.
+    """
+    if platform.system() == "Windows":
+        HOST = "127.0.0.1"
+        PORT = 65432
+    else:
+        SOCKET_PATH = "/tmp/phpgp.sock"
+
+    with open(file, "r") as f:
+        data = f.read()
+
+    request = {
+        "operation": "encrypt",
+        "data": data,
+        "recipient_email": recipient_email
+    }
+    request_json = json.dumps(request)
+
+    try:
+        if platform.system() == "Windows":
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect((HOST, PORT))
+                client_socket.sendall(request_json.encode())
+
+                response_data = client_socket.recv(65536).decode()
+                response = json.loads(response_data)
+
+                if "encrypted" in response:
+                    encrypted_file = f"{file}.enc"
+                    with open(encrypted_file, "w") as f_enc:
+                        f_enc.write(response["encrypted"])
+                    click.echo(f"File encrypted and saved as {encrypted_file}")
+                else:
+                    click.echo(response.get(
+                        "error", "Unknown error occurred."), err=True)
+                    sys.exit(1)
+        else:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect(SOCKET_PATH)
+                client_socket.sendall(request_json.encode())
+
+                response_data = client_socket.recv(65536).decode()
+                response = json.loads(response_data)
+
+                if "encrypted" in response:
+                    encrypted_file = f"{file}.enc"
+                    with open(encrypted_file, "w") as f_enc:
+                        f_enc.write(response["encrypted"])
+                    click.echo(f"File encrypted and saved as {encrypted_file}")
+                else:
+                    click.echo(response.get(
+                        "error", "Unknown error occurred."), err=True)
+                    sys.exit(1)
+    except Exception as e:
+        click.echo(f"Error connecting to phpgp server: {str(e)}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True))
+def decrypt(file):
+    """
+    Decrypts a file through the server. The server uses the private key
+    to decrypt. The resulting plaintext is saved as <file>.dec.
+    """
+    if platform.system() == "Windows":
+        HOST = "127.0.0.1"
+        PORT = 65432
+    else:
+        SOCKET_PATH = "/tmp/phpgp.sock"
+
+    with open(file, "r") as f:
+        encrypted_data = f.read()
+
+    request = {
+        "operation": "decrypt",
+        "data": encrypted_data
+    }
+    request_json = json.dumps(request)
+
+    try:
+        if platform.system() == "Windows":
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect((HOST, PORT))
+                client_socket.sendall(request_json.encode())
+
+                response_data = client_socket.recv(65536).decode()
+                response = json.loads(response_data)
+
+                if "decrypted" in response:
+                    decrypted_file = f"{file}.dec"
+                    with open(decrypted_file, "w") as f_dec:
+                        f_dec.write(response["decrypted"])
+                    click.echo(f"File decrypted and saved as {decrypted_file}")
+                else:
+                    click.echo(response.get(
+                        "error", "Unknown error occurred."), err=True)
+                    sys.exit(1)
+        else:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect(SOCKET_PATH)
+                client_socket.sendall(request_json.encode())
+
+                response_data = client_socket.recv(65536).decode()
+                response = json.loads(response_data)
+
+                if "decrypted" in response:
+                    decrypted_file = f"{file}.dec"
+                    with open(decrypted_file, "w") as f_dec:
+                        f_dec.write(response["decrypted"])
+                    click.echo(f"File decrypted and saved as {decrypted_file}")
+                else:
+                    click.echo(response.get(
+                        "error", "Unknown error occurred."), err=True)
+                    sys.exit(1)
+    except Exception as e:
+        click.echo(f"Error connecting to phpgp server: {str(e)}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+def unmount():
+    """
+    Unmount the phpgp server by terminating its process using the PID stored in the cache directory.
+    """
+    import psutil
+
+    pid_file = get_pid_file_path()
+    if os.path.exists(pid_file):
+        with open(pid_file, "r") as f:
+            try:
+                pid = int(f.read())
+            except ValueError:
+                click.echo("Invalid PID in PID file.")
+                sys.exit(1)
+
+        try:
+            proc = psutil.Process(pid)
+            if "python" in proc.name().lower():
+                proc.terminate()
+                proc.wait(timeout=5)
+                click.echo("phpgp server stopped.")
+            else:
+                click.echo(
+                    "Process with PID does not seem to be phpgp server.")
+        except psutil.NoSuchProcess:
+            click.echo("phpgp server is not running.")
+        except psutil.TimeoutExpired:
+            click.echo("Failed to terminate phpgp server.")
+        except Exception as e:
+            click.echo(f"Error stopping server: {e}", err=True)
+
+        # Remove the PID file from cache directory
+        try:
+            os.remove(pid_file)
+        except Exception as e:
+            click.echo(f"Error removing PID file: {e}", err=True)
+    else:
+        click.echo(
+            "phpgp server PID file not found. Server might not be running.")
+
+
+if __name__ == "__main__":
+    cli()
