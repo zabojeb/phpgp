@@ -241,6 +241,4 @@ You should have received a copy of the GNU General Public License along with thi
 
 ---
 
-**Enjoy secure and convenient PGP key usage with phpgp!**
-
-Made with <3 by zabojeb"
+**Enjoy secure and convenient PGP key usage with phPGP!**
