@@ -37,6 +37,11 @@ if platform.system() == "Windows":
 else:
     SOCKET_PATH = "/tmp/phpgp.sock"
 
+# Store original key data at the module level
+ORIGINAL_PRIVATE_KEY_DATA = None
+ORIGINAL_PUBLIC_KEY_DATA = None
+KEYS_REMOVED_FROM_DRIVE = True
+
 
 def start_server(private_key_data, public_key_data, passphrase):
     """
@@ -47,6 +52,13 @@ def start_server(private_key_data, public_key_data, passphrase):
     :param public_key_data: str, armored public key
     :param passphrase: str, passphrase to unlock the private key
     """
+
+    global ORIGINAL_PRIVATE_KEY_DATA
+    global ORIGINAL_PUBLIC_KEY_DATA
+
+    ORIGINAL_PRIVATE_KEY_DATA = private_key_data
+    ORIGINAL_PUBLIC_KEY_DATA = public_key_data
+
     # Parse the keys from the provided data
     private_key, _ = PGPKey.from_blob(private_key_data)
     public_key, _ = PGPKey.from_blob(public_key_data)
@@ -155,6 +167,17 @@ def start_server(private_key_data, public_key_data, passphrase):
                             response["error"] = "Decryption failed."
                     except Exception as e:
                         response["error"] = f"Decryption error: {str(e)}"
+
+            elif operation == "restore":
+                # Key restoring operation
+                # well, actually we should do smthn with KEYS_REMOVED_FROM_DRIVE based on user's choice
+                # but we don't
+                if KEYS_REMOVED_FROM_DRIVE:
+                    response["private_key_data"] = ORIGINAL_PRIVATE_KEY_DATA
+                    response["public_key_data"] = ORIGINAL_PUBLIC_KEY_DATA
+                else:
+                    response["error"] = "Keys were not removed from the drive. Nothing to restore."
+
             else:
                 response["error"] = f"Unsupported operation: {operation}"
 
@@ -179,7 +202,7 @@ def start_server(private_key_data, public_key_data, passphrase):
             try:
                 server.bind((HOST, PORT))
                 server.listen()
-                logger.info(f"phpgp signing server started on {HOST}:{PORT}")
+                logger.info(f"phpgp server started on {HOST}:{PORT}")
             except Exception as e:
                 logger.error(f"Failed to bind server on {HOST}:{PORT}: {e}")
                 sys.exit(1)
@@ -200,7 +223,7 @@ def start_server(private_key_data, public_key_data, passphrase):
             try:
                 server.bind(SOCKET_PATH)
                 server.listen()
-                logger.info(f"phpgp signing server started on {SOCKET_PATH}")
+                logger.info(f"phpgp server started on {SOCKET_PATH}")
             except Exception as e:
                 logger.error(f"Failed to bind server on {SOCKET_PATH}: {e}")
                 sys.exit(1)

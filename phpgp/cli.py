@@ -114,19 +114,19 @@ def status():
         click.echo(f"{drive}: {status}")
 
 
+
 @cli.command()
 def mount():
     """
-    Mount a configured external drive. Launches the phpgp server in the
-    current terminal, unlocking the user's private key (optionally removing
-    the copies from the external drive).
+    Mount a configured external drive, and optionally remove the key files
+    from the drive. If removed, the server keeps them in memory, so
+    we can restore them on unmount.
     """
     drive = select_drive()
     phpgp_path = os.path.join(drive, ".phpgp")
 
     if not os.path.exists(phpgp_path):
-        click.echo(
-            "Selected drive is not configured. Please run 'phpgp configure' first.")
+        click.echo("Selected drive is not configured. Please run 'phpgp configure' first.")
         sys.exit(1)
 
     private_key_path = os.path.join(phpgp_path, "private", "private_key.asc")
@@ -136,16 +136,13 @@ def mount():
         click.echo("Key files not found on the drive.")
         sys.exit(1)
 
-    # Load keys into memory
     with open(private_key_path, "r") as f:
         private_key_data = f.read()
     with open(public_key_path, "r") as f:
         public_key_data = f.read()
 
-    # Prompt for passphrase
     password = getpass("Enter passphrase for your private key: ")
 
-    # Prepare environment variables for the server
     env = os.environ.copy()
     env.update({
         "PRIVATE_KEY": private_key_data,
@@ -153,14 +150,18 @@ def mount():
         "PRIVATE_KEY_PASSPHRASE": password
     })
 
-    # Configure startup info for Windows to hide the server window
+    remove_keys = click.confirm("Delete key files from the external drive?", default=True)
+    if remove_keys:
+        env["KEYS_REMOVED_FROM_DRIVE"] = "1"
+    else:
+        env["KEYS_REMOVED_FROM_DRIVE"] = "0"
+
     startupinfo = None
     if platform.system() == "Windows":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
 
-    # Start the server process
     server_process = subprocess.Popen(
         [sys.executable, "-m", "phpgp.server"],
         env=env,
@@ -171,27 +172,21 @@ def mount():
     )
     click.echo("phpgp server started.")
 
-    # Get the PID file path from cache directory
     pid_file = get_pid_file_path()
     with open(pid_file, "w") as f:
         f.write(str(server_process.pid))
 
-    # Stream server output to the terminal
     def stream_output(process):
         for line in iter(process.stdout.readline, ""):
             click.echo(line, nl=False)
         for line in iter(process.stderr.readline, ""):
             click.echo(line, nl=False, err=True)
 
-    output_thread = threading.Thread(
-        target=stream_output, args=(server_process,))
-    output_thread.daemon = True  # Allows the thread to exit when the main program exits
+    output_thread = threading.Thread(target=stream_output, args=(server_process,))
+    output_thread.daemon = True
     output_thread.start()
 
-    # Optionally delete keys from the external drive
-    delete = click.confirm(
-        "Delete key files from the external drive?", default=True)
-    if delete:
+    if remove_keys:
         os.remove(private_key_path)
         os.remove(public_key_path)
         click.echo("Keys removed from the external drive.")
@@ -471,8 +466,65 @@ def unmount():
     """
     Unmount the phpgp server by terminating its process using the PID stored in the cache directory.
     """
-    import psutil
 
+    # 1) Attempt to restore keys from the server
+    drive = select_drive()  # TODO: make server memorize the drive
+    phpgp_path = os.path.join(drive, ".phpgp")
+    private_dir = os.path.join(phpgp_path, "private")
+    public_dir = os.path.join(phpgp_path, "public")
+    os.makedirs(private_dir, exist_ok=True)
+    os.makedirs(public_dir, exist_ok=True)
+
+    if platform.system() == "Windows":
+        HOST = "127.0.0.1"
+        PORT = 65432
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect((HOST, PORT))
+                request_json = json.dumps(
+                    {"operation": "restore"}).encode()
+                client_socket.sendall(request_json)
+                response_data = client_socket.recv(65536).decode()
+                resp = json.loads(response_data)
+
+                if "private_key_data" in resp and "public_key_data" in resp:
+                    private_file = os.path.join(private_dir, "private_key.asc")
+                    public_file = os.path.join(public_dir, "public_key.asc")
+                    with open(private_file, "w") as f_pk:
+                        f_pk.write(resp["private_key_data"])
+                    with open(public_file, "w") as f_pub:
+                        f_pub.write(resp["public_key_data"])
+                    click.echo(
+                        "Private/public keys restored to the external drive.")
+                elif "error" in resp:
+                    click.echo(f"Cannot restore keys: {resp['error']}")
+        except Exception as e:
+            click.echo(f"Error requesting 'restore': {e}")
+    else:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+                client_socket.connect(SOCKET_PATH)
+                request_json = json.dumps(
+                    {"operation": "restore_keys"}).encode()
+                client_socket.sendall(request_json)
+                response_data = client_socket.recv(65536).decode()
+                resp = json.loads(response_data)
+
+                if "private_key_data" in resp and "public_key_data" in resp:
+                    private_file = os.path.join(private_dir, "private_key.asc")
+                    public_file = os.path.join(public_dir, "public_key.asc")
+                    with open(private_file, "w") as f_pk:
+                        f_pk.write(resp["private_key_data"])
+                    with open(public_file, "w") as f_pub:
+                        f_pub.write(resp["public_key_data"])
+                    click.echo(
+                        "Private/public keys restored to the external drive.")
+                elif "error" in resp:
+                    click.echo(f"Cannot restore keys: {resp['error']}")
+        except Exception as e:
+            click.echo(f"Error requesting 'restore_keys': {e}")
+
+    # 2) Kill the server
     pid_file = get_pid_file_path()
     if os.path.exists(pid_file):
         with open(pid_file, "r") as f:
@@ -498,7 +550,6 @@ def unmount():
         except Exception as e:
             click.echo(f"Error stopping server: {e}", err=True)
 
-        # Remove the PID file from cache directory
         try:
             os.remove(pid_file)
         except Exception as e:
