@@ -144,8 +144,8 @@ Let's take a closer look at this.
 
   Removes the locally imported secret key from your GPG instance.
 
-  > [!NOTE]
-  > For greater security, you can set your computer to delete the private key automatically with this command when you disconnect the USB. You can do the same with key downloading for convenience.
+> [!NOTE]
+> For greater security, you can set your computer to delete the private key automatically with this command when you disconnect the USB. You can do the same with key downloading for convenience.
 
 ## Cryptographic Operations
 
