@@ -339,9 +339,7 @@ def sign(file):
 @click.argument("recipient_email")
 def encrypt(file, recipient_email):
     """
-    Encrypts a file for the specified recipient email through the server.
-    The server is expected to find or fetch the recipient's public key
-    (if that part is implemented) or use the existing logic.
+    Encrypts a file for the specified recipient PGP key through the server.
     """
     if platform.system() == "Windows":
         HOST = "127.0.0.1"
