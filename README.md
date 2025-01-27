@@ -58,7 +58,7 @@ Simply install it via pip:
 pip install phpgp
 ```
 
-or via pipx:
+or via pipx (recommended):
 
 ```bash
 pipx install phpgp
