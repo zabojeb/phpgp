@@ -24,6 +24,9 @@ import logging
 import threading
 import platform
 
+import ctypes
+import resource
+
 from pgpy import PGPKey, PGPMessage
 from pgpy.constants import HashAlgorithm, SignatureType
 
@@ -43,6 +46,54 @@ ORIGINAL_PUBLIC_KEY_DATA = None
 KEYS_REMOVED_FROM_DRIVE = True
 
 
+def apply_security_measures():
+    """
+    Apply OS-level security measures to protect the server process.
+    """
+    system = platform.system()
+
+    if system != "Windows":
+        # 1. Disable core dumps
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            logger.info("Core dumps have been disabled.")
+        except Exception as e:
+            logger.warning(f"Could not disable core dumps: {e}")
+
+        # 2. Set process as non-dumpable (Linux-specific)
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            PR_SET_DUMPABLE = 4
+            libc.prctl(PR_SET_DUMPABLE, 0)
+            logger.info("Process has been set to non-dumpable (prctl).")
+        except Exception as e:
+            logger.warning(f"Could not set process non-dumpable: {e}")
+
+        # 3. Lock memory to prevent swapping (mlockall)
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            MCL_CURRENT = 1
+            MCL_FUTURE = 2
+            res = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+            if res == 0:
+                logger.info("Memory has been locked (mlockall).")
+            else:
+                logger.warning("mlockall failed. You may lack sufficient privileges.")
+        except Exception as e:
+            logger.warning(f"Could not lock memory: {e}")
+
+        # 4. Set resource limits
+        try:
+            # Ограничение количества открытых файлов
+            resource.setrlimit(resource.RLIMIT_NOFILE, (100, 100))
+            # Ограничение количества процессов/потоков
+            resource.setrlimit(resource.RLIMIT_NPROC, (50, 50))
+            logger.info("Resource limits have been set.")
+        except Exception as e:
+            logger.warning(f"Could not set resource limits: {e}")
+    else:
+        logger.info("Windows OS detected. Skipping Unix-specific hardening measures.")
+
 def start_server(private_key_data, public_key_data, passphrase):
     """
     Starts the phpgp server which handles signing, encryption, and decryption
@@ -52,6 +103,8 @@ def start_server(private_key_data, public_key_data, passphrase):
     :param public_key_data: str, armored public key
     :param passphrase: str, passphrase to unlock the private key
     """
+
+    apply_security_measures()
 
     global ORIGINAL_PRIVATE_KEY_DATA
     global ORIGINAL_PUBLIC_KEY_DATA
