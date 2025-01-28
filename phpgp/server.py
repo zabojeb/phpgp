@@ -25,7 +25,6 @@ import threading
 import platform
 
 import ctypes
-import resource
 
 from pgpy import PGPKey, PGPMessage
 from pgpy.constants import HashAlgorithm, SignatureType
@@ -38,6 +37,7 @@ if platform.system() == "Windows":
     HOST = "127.0.0.1"
     PORT = 65432
 else:
+    import resource
     SOCKET_PATH = "/tmp/phpgp.sock"
 
 # Store original key data at the module level
