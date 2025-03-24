@@ -84,9 +84,7 @@ def apply_security_measures():
 
         # 4. Set resource limits
         try:
-            # Ограничение количества открытых файлов
             resource.setrlimit(resource.RLIMIT_NOFILE, (100, 100))
-            # Ограничение количества процессов/потоков
             resource.setrlimit(resource.RLIMIT_NPROC, (50, 50))
             logger.info("Resource limits have been set.")
         except Exception as e:
