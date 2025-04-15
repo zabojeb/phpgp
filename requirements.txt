@@ -1,6 +1,7 @@
-pgpy
+pgpy13
 psutil
 prompt_toolkit
 click
 cryptography
 python-gnupg
+keyring

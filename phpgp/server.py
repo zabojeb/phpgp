@@ -29,10 +29,33 @@ import ctypes
 from pgpy import PGPKey, PGPMessage
 from pgpy.constants import HashAlgorithm, SignatureType
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---- Secure, pure in-memory keyring backend ----
+import keyring.backend
 
-# Determine socket paths based on the OS
+
+class InMemoryKeyring(keyring.backend.KeyringBackend):
+    """ A per-process, in-memory keyring (never persisted to disk). """
+    priority = 10
+    _storage = dict()
+
+    def get_password(self, servicename, username):
+        return self._storage.get((servicename, username), None)
+
+    def set_password(self, servicename, username, password):
+        self._storage[(servicename, username)] = password
+
+    def delete_password(self, servicename, username):
+        try:
+            del self._storage[(servicename, username)]
+        except KeyError:
+            raise keyring.errors.PasswordDeleteError
+
+
+keyring.set_keyring(InMemoryKeyring())
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("phpgp.server")
+
 if platform.system() == "Windows":
     HOST = "127.0.0.1"
     PORT = 65432
@@ -40,27 +63,15 @@ else:
     import resource
     SOCKET_PATH = "/tmp/phpgp.sock"
 
-# Store original key data at the module level
-ORIGINAL_PRIVATE_KEY_DATA = None
-ORIGINAL_PUBLIC_KEY_DATA = None
-KEYS_REMOVED_FROM_DRIVE = True
-
 
 def apply_security_measures():
-    """
-    Apply OS-level security measures to protect the server process.
-    """
     system = platform.system()
-
     if system != "Windows":
-        # 1. Disable core dumps
         try:
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             logger.info("Core dumps have been disabled.")
         except Exception as e:
             logger.warning(f"Could not disable core dumps: {e}")
-
-        # 2. Set process as non-dumpable (Linux-specific)
         try:
             libc = ctypes.CDLL("libc.so.6")
             PR_SET_DUMPABLE = 4
@@ -68,8 +79,6 @@ def apply_security_measures():
             logger.info("Process has been set to non-dumpable (prctl).")
         except Exception as e:
             logger.warning(f"Could not set process non-dumpable: {e}")
-
-        # 3. Lock memory to prevent swapping (mlockall)
         try:
             libc = ctypes.CDLL("libc.so.6")
             MCL_CURRENT = 1
@@ -78,11 +87,10 @@ def apply_security_measures():
             if res == 0:
                 logger.info("Memory has been locked (mlockall).")
             else:
-                logger.warning("mlockall failed. You may lack sufficient privileges.")
+                logger.warning(
+                    "mlockall failed. You may lack sufficient privileges.")
         except Exception as e:
             logger.warning(f"Could not lock memory: {e}")
-
-        # 4. Set resource limits
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (100, 100))
             resource.setrlimit(resource.RLIMIT_NPROC, (50, 50))
@@ -90,55 +98,79 @@ def apply_security_measures():
         except Exception as e:
             logger.warning(f"Could not set resource limits: {e}")
     else:
-        logger.info("Windows OS detected. Skipping Unix-specific hardening measures.")
+        logger.info(
+            "Windows OS detected. Skipping Unix-specific hardening measures.")
 
-def start_server(private_key_data, public_key_data, passphrase):
-    """
-    Starts the phpgp server which handles signing, encryption, and decryption
-    requests via TCP (on Windows) or Unix Domain Socket (on Unix-like systems).
 
-    :param private_key_data: str, armored private key
-    :param public_key_data: str, armored public key
-    :param passphrase: str, passphrase to unlock the private key
-    """
+def load_keys_from_stdin():
+    """Read a JSON blob with private, public key, passphrase, and flag from stdin."""
+    buf = ''
+    while True:
+        ch = sys.stdin.read(1)
+        if ch == '':
+            break  # EOF
+        buf += ch
+    try:
+        d = json.loads(buf)
+        return d
+    except Exception as e:
+        logger.error(f"Could not parse keys/passphrase blob from stdin: {e}")
+        sys.exit(1)
 
+
+def store_keys_in_memory(private_key_data, public_key_data, passphrase, keys_removed):
+    # Keyring keys uniquely for this instance.
+    KR_BASE = "phpgp/active"
+    keyring.set_password(KR_BASE, "private_key", private_key_data)
+    keyring.set_password(KR_BASE, "public_key", public_key_data)
+    keyring.set_password(KR_BASE, "passphrase", passphrase)
+    keyring.set_password(KR_BASE, "keys_removed", "1" if keys_removed else "0")
+
+
+def get_key_from_memory(what):
+    KR_BASE = "phpgp/active"
+    return keyring.get_password(KR_BASE, what)
+
+
+def start_server():
     apply_security_measures()
 
-    global ORIGINAL_PRIVATE_KEY_DATA
-    global ORIGINAL_PUBLIC_KEY_DATA
+    # --- Step 1: Receive keys via stdin and store in RAM only ---
+    d = load_keys_from_stdin()
+    store_keys_in_memory(d.get("private_key", ""), d.get("public_key", ""),
+                         d.get("passphrase", ""), d.get("keys_removed", True))
 
-    ORIGINAL_PRIVATE_KEY_DATA = private_key_data
-    ORIGINAL_PUBLIC_KEY_DATA = public_key_data
+    private_key_data = get_key_from_memory("private_key")
+    public_key_data = get_key_from_memory("public_key")
+    passphrase = get_key_from_memory("passphrase")
+    keys_removed_from_drive = get_key_from_memory("keys_removed") == "1"
 
-    # Parse the keys from the provided data
-    private_key, _ = PGPKey.from_blob(private_key_data)
-    public_key, _ = PGPKey.from_blob(public_key_data)
+    # Step 2: Parse PGP keys
+    try:
+        private_key, _ = PGPKey.from_blob(private_key_data)
+        public_key, _ = PGPKey.from_blob(public_key_data)
+    except Exception as e:
+        logger.error(f"Cannot parse PGP keys: {e}")
+        sys.exit(1)
 
-    # Unlock the private key if it is protected
     if private_key.is_protected:
         try:
             unlocked = private_key.unlock(passphrase)
             if unlocked:
                 logger.info("Private key successfully unlocked.")
             else:
-                logger.error(
-                    "Failed to unlock the private key. Check the passphrase.")
+                logger.error("Failed to unlock private key.")
                 sys.exit(1)
         except Exception as e:
             logger.error(f"Exception during unlocking key: {e}")
             sys.exit(1)
     else:
-        logger.info("Private key is not protected by a passphrase.")
+        logger.info("Private key was not protected by a passphrase.")
 
+    # --- Step 3: Serve socket requests ---
     def handle_client_connection(client_socket, address=None):
-        """
-        Handles individual client connections. Receives a JSON request,
-        interprets the 'operation' field, and responds accordingly with
-        a JSON response.
-        """
         try:
             logger.info(f"Connection from {address}")
-            # Increase buffer size for large data
             data = client_socket.recv(65536).decode()
             if not data:
                 logger.info("No data received.")
@@ -151,16 +183,12 @@ def start_server(private_key_data, public_key_data, passphrase):
             response = {}
 
             if operation == "sign":
-                # SIGN operation
                 encoded_data = request.get("data")
                 if not encoded_data:
                     response["error"] = "No data provided for signing."
                 else:
-                    # Decode data from base64 to bytes
                     data_bytes = base64.b64decode(encoded_data)
-                    # Create a PGPMessage from the raw bytes
                     message = PGPMessage.new(data_bytes, file=True)
-                    # Sign with detached=True for a detached signature
                     if private_key.is_protected:
                         with private_key.unlock(passphrase):
                             signature = private_key.sign(
@@ -179,7 +207,6 @@ def start_server(private_key_data, public_key_data, passphrase):
                     response["signature"] = str(signature)
 
             elif operation == "encrypt":
-                # ENCRYPT operation
                 message_data = request.get("data")
                 recipient_key_data = request.get("recipient_key")
                 if not message_data or not recipient_key_data:
@@ -187,15 +214,10 @@ def start_server(private_key_data, public_key_data, passphrase):
                 else:
                     recipient_key, _ = PGPKey.from_blob(recipient_key_data)
                     message = PGPMessage.new(message_data)
-                    if private_key.is_protected:
-                        with private_key.unlock(passphrase):
-                            encrypted_message = recipient_key.encrypt(message)
-                    else:
-                        encrypted_message = recipient_key.encrypt(message)
+                    encrypted_message = recipient_key.encrypt(message)
                     response["encrypted"] = str(encrypted_message)
 
             elif operation == "decrypt":
-                # DECRYPT operation
                 encrypted_data = request.get("data")
                 if not encrypted_data:
                     response["error"] = "No data provided for decryption."
@@ -210,7 +232,6 @@ def start_server(private_key_data, public_key_data, passphrase):
                         else:
                             decrypted_message = private_key.decrypt(
                                 encrypted_message)
-
                         if decrypted_message.ok:
                             response["decrypted"] = str(
                                 decrypted_message.message)
@@ -219,21 +240,16 @@ def start_server(private_key_data, public_key_data, passphrase):
                     except Exception as e:
                         response["error"] = f"Decryption error: {str(e)}"
 
-            elif operation == "restore":
-                # Key restoring operation
-                # well, actually we should do smthn with KEYS_REMOVED_FROM_DRIVE based on user's choice
-                # but we don't
-                if KEYS_REMOVED_FROM_DRIVE:
-                    response["private_key_data"] = ORIGINAL_PRIVATE_KEY_DATA
-                    response["public_key_data"] = ORIGINAL_PUBLIC_KEY_DATA
+            elif operation in ("restore", "restore_keys"):
+                if keys_removed_from_drive:
+                    response["private_key_data"] = private_key_data
+                    response["public_key_data"] = public_key_data
                 else:
                     response["error"] = "Keys were not removed from the drive. Nothing to restore."
-
             else:
                 response["error"] = f"Unsupported operation: {operation}"
 
-            response_data = json.dumps(response)
-            client_socket.sendall(response_data.encode())
+            client_socket.sendall(json.dumps(response).encode())
             logger.info(f"Processed {operation} operation from {address}")
         except json.JSONDecodeError:
             response = {"error": "Invalid JSON format."}
@@ -246,9 +262,7 @@ def start_server(private_key_data, public_key_data, passphrase):
         finally:
             client_socket.close()
 
-    # Start the server depending on the OS
     if platform.system() == "Windows":
-        # Use TCP socket on Windows
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             try:
                 server.bind((HOST, PORT))
@@ -257,7 +271,6 @@ def start_server(private_key_data, public_key_data, passphrase):
             except Exception as e:
                 logger.error(f"Failed to bind server on {HOST}:{PORT}: {e}")
                 sys.exit(1)
-
             while True:
                 client, addr = server.accept()
                 client_handler = threading.Thread(
@@ -266,10 +279,8 @@ def start_server(private_key_data, public_key_data, passphrase):
                 )
                 client_handler.start()
     else:
-        # Use Unix Domain Socket on Unix-like systems
         if os.path.exists(SOCKET_PATH):
             os.remove(SOCKET_PATH)
-
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             try:
                 server.bind(SOCKET_PATH)
@@ -278,7 +289,6 @@ def start_server(private_key_data, public_key_data, passphrase):
             except Exception as e:
                 logger.error(f"Failed to bind server on {SOCKET_PATH}: {e}")
                 sys.exit(1)
-
             while True:
                 client, _ = server.accept()
                 client_handler = threading.Thread(
@@ -289,17 +299,4 @@ def start_server(private_key_data, public_key_data, passphrase):
 
 
 if __name__ == "__main__":
-    # Retrieve environment variables for private/public keys and passphrase
-    private_key_data = os.getenv("PRIVATE_KEY")
-    public_key_data = os.getenv("PUBLIC_KEY")
-    private_key_passphrase = os.getenv("PRIVATE_KEY_PASSPHRASE")
-
-    if not private_key_data or not public_key_data:
-        logger.error(
-            "PRIVATE_KEY and PUBLIC_KEY environment variables must be set.")
-        sys.exit(1)
-
-    if private_key_passphrase:
-        start_server(private_key_data, public_key_data, private_key_passphrase)
-    else:
-        start_server(private_key_data, public_key_data, "")
+    start_server()

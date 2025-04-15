@@ -30,8 +30,10 @@ import click
 import gnupg
 import psutil
 from pgpy import PGPKey, PGPMessage
+import keyring
+import tempfile
 
-from .utils import select_drive, get_pid_file_path, get_cache_dir
+from .utils import select_drive, get_pid_file_path, get_cache_dir, find_external_drives
 from .server import start_server
 
 if platform.system() == "Windows":
@@ -39,6 +41,42 @@ if platform.system() == "Windows":
     PORT = 65432
 else:
     SOCKET_PATH = "/tmp/phpgp.sock"
+
+
+def start_phpgp_server_with_stdin(private_key_data, public_key_data, passphrase, keys_removed_from_drive):
+    """
+    Start the phpgp.server as subprocess, passing the keys and passphrase via stdin.
+    """
+    import json
+    import sys
+    import platform
+
+    keyblob = json.dumps({
+        "private_key": private_key_data,
+        "public_key": public_key_data,
+        "passphrase": passphrase,
+        "keys_removed": bool(keys_removed_from_drive),
+    })
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        proc = subprocess.Popen([sys.executable, "-m", "phpgp.server"],
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                startupinfo=startupinfo,
+                                text=True)
+    else:
+        proc = subprocess.Popen([sys.executable, "-m", "phpgp.server"],
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True)
+    proc.stdin.write(keyblob)
+    proc.stdin.flush()
+    proc.stdin.close()
+    return proc
 
 
 @click.group()
@@ -96,10 +134,7 @@ def status():
     Checks the status of connected external drives, indicating whether
     each is ready to mount (contains .phpgp) or ready to configure.
     """
-    partitions = psutil.disk_partitions()
-    external_drives = [
-        p.mountpoint for p in partitions if 'removable' in p.opts or 'usb' in p.opts
-    ]
+    external_drives = find_external_drives()
 
     if not external_drives:
         click.echo("No external drives found.")
@@ -114,7 +149,6 @@ def status():
         click.echo(f"{drive}: {status}")
 
 
-
 @cli.command()
 def mount():
     """
@@ -126,7 +160,8 @@ def mount():
     phpgp_path = os.path.join(drive, ".phpgp")
 
     if not os.path.exists(phpgp_path):
-        click.echo("Selected drive is not configured. Please run 'phpgp configure' first.")
+        click.echo(
+            "Selected drive is not configured. Please run 'phpgp configure' first.")
         sys.exit(1)
 
     private_key_path = os.path.join(phpgp_path, "private", "private_key.asc")
@@ -150,25 +185,18 @@ def mount():
         "PRIVATE_KEY_PASSPHRASE": password
     })
 
-    remove_keys = click.confirm("Delete key files from the external drive?", default=True)
-    if remove_keys:
-        env["KEYS_REMOVED_FROM_DRIVE"] = "1"
-    else:
-        env["KEYS_REMOVED_FROM_DRIVE"] = "0"
-
     startupinfo = None
     if platform.system() == "Windows":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
 
-    server_process = subprocess.Popen(
-        [sys.executable, "-m", "phpgp.server"],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        startupinfo=startupinfo,
-        text=True
+    remove_keys = click.confirm(
+        "Delete key files from the external drive?", default=True)
+    keys_removed_flag = bool(remove_keys)
+
+    server_process = start_phpgp_server_with_stdin(
+        private_key_data, public_key_data, password, keys_removed_flag
     )
     click.echo("phpgp server started.")
 
@@ -182,7 +210,8 @@ def mount():
         for line in iter(process.stderr.readline, ""):
             click.echo(line, nl=False, err=True)
 
-    output_thread = threading.Thread(target=stream_output, args=(server_process,))
+    output_thread = threading.Thread(
+        target=stream_output, args=(server_process,))
     output_thread.daemon = True
     output_thread.start()
 

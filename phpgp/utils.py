@@ -21,6 +21,14 @@ import click
 import platform
 
 
+def find_external_drives():
+    partitions = psutil.disk_partitions()
+    external_drives = [
+        p.mountpoint for p in partitions if 'removable' in p.opts or 'usb' in p.opts or p.mountpoint.startswith("/Volumes/")
+    ]
+    return external_drives
+
+
 def select_drive():
     """
     Prompts the user to select a removable (USB) drive from the list of available external drives.
@@ -28,10 +36,7 @@ def select_drive():
 
     :return: The mountpoint of the selected external drive.
     """
-    partitions = psutil.disk_partitions()
-    external_drives = [
-        p.mountpoint for p in partitions if 'removable' in p.opts or 'usb' in p.opts
-    ]
+    external_drives = find_external_drives()
 
     if not external_drives:
         click.echo("No external drives found.")
