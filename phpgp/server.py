@@ -218,13 +218,14 @@ def start_server():
                     response["encrypted"] = str(encrypted_message)
 
             elif operation == "decrypt":
-                encrypted_data = request.get("data")
-                if not encrypted_data:
+                encoded_data = request.get("data")
+                if not encoded_data:
                     response["error"] = "No data provided for decryption."
                 else:
                     try:
-                        encrypted_message = PGPMessage.from_blob(
-                            encrypted_data)
+                        encrypted_bytes = base64.b64decode(encoded_data)
+                        encrypted_message = PGPMessage.from_blob(encrypted_bytes)
+
                         if private_key.is_protected:
                             with private_key.unlock(passphrase):
                                 decrypted_message = private_key.decrypt(
@@ -232,7 +233,7 @@ def start_server():
                         else:
                             decrypted_message = private_key.decrypt(
                                 encrypted_message)
-                        if decrypted_message.ok:
+                        if decrypted_message:
                             response["decrypted"] = str(
                                 decrypted_message.message)
                         else:

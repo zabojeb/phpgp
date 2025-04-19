@@ -365,11 +365,24 @@ def sign(file):
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
-@click.argument("recipient_email")
+@click.option("-r", "--recipient-email", prompt="Recipient email", help="Email on which PGP key is registered on the server")
 def encrypt(file, recipient_email):
     """
     Encrypts a file for the specified recipient PGP key through the server.
     """
+    gpg = gnupg.GPG()
+    keys = gpg.list_keys()
+    for key in keys:
+        if recipient_email in key["uids"][0]:
+            recipient_fpr = key["fingerprint"]
+            break
+
+    else:
+        click.echo("Public key not found.", err=True)
+        sys.exit(1)
+
+    recipient_key_data = gpg.export_keys(recipient_fpr)
+
     if platform.system() == "Windows":
         HOST = "127.0.0.1"
         PORT = 65432
@@ -382,7 +395,7 @@ def encrypt(file, recipient_email):
     request = {
         "operation": "encrypt",
         "data": data,
-        "recipient_email": recipient_email
+        "recipient_key": recipient_key_data
     }
     request_json = json.dumps(request)
 
@@ -439,12 +452,14 @@ def decrypt(file):
     else:
         SOCKET_PATH = "/tmp/phpgp.sock"
 
-    with open(file, "r") as f:
-        encrypted_data = f.read()
+    with open(file, "rb") as f:
+        encrypted_bytes = f.read()
+
+    encoded_data = base64.b64encode(encrypted_bytes).decode("utf-8")
 
     request = {
         "operation": "decrypt",
-        "data": encrypted_data
+        "data": encoded_data
     }
     request_json = json.dumps(request)
 
